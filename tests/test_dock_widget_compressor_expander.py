@@ -1,6 +1,6 @@
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 from PyQt5.QtWidgets import QApplication
 
@@ -9,47 +9,9 @@ for p in [os.path.join(PROJECT_ROOT, 'src', 'main'), os.path.join(PROJECT_ROOT, 
     if p not in sys.path:
         sys.path.insert(0, p)
 
-_saved_modules = {k: sys.modules.get(k) for k in [
-    'utils.Graphics', 'python.utils.Graphics', 'utils.Container', 'python.utils.Container'
-]}
-
-mock_graphics = MagicMock()
-mock_container = MagicMock()
-mock_graphics.lst = []
-
-sys.modules['utils.Graphics'] = mock_graphics
-sys.modules['python.utils.Graphics'] = mock_graphics
-sys.modules['utils.Container'] = mock_container
-sys.modules['python.utils.Container'] = mock_container
-
-app = QApplication.instance()
-if app is None:
-    app = QApplication(sys.argv)
-
-from DockWidgets.DockWidgetCompressorExpander import DockWidgetCompressorExpander
-
-for k, v in _saved_modules.items():
-    if v is None:
-        sys.modules.pop(k, None)
-    else:
-        sys.modules[k] = v
-
-
-class MockCompressorObj:
-    def __init__(self, name="Compressor1"):
-        self.name = name
-        self.type = "Compressor"
-        self.modes_list = ["Outlet Pressure", "Pressure Ratio"]
-        self.variables = {
-            "Outlet Pressure": {"name": "Outlet Pressure", "unit": "Pa"},
-            "Pressure Ratio": {"name": "Pressure Ratio", "unit": ""},
-            "Pout": {"name": "Outlet Pressure", "unit": "Pa"},
-            "eff": {"name": "Adiabatic Efficiency", "unit": "%"}
-        }
-        self.param_setter = MagicMock()
-
-    def param_getter(self, mode="Outlet Pressure"):
-        return {"Pout": "200000", "eff": "75"}
+from python.utils.ComponentSelector import compound_selected
+from python.utils.UnitOperations import AdiabaticCompressor, AdiabaticExpander
+from python.DockWidgets.DockWidgetCompressorExpander import DockWidgetCompressorExpander
 
 
 class MockContainerInstance:
@@ -58,39 +20,170 @@ class MockContainerInstance:
         self.graphics.graphicsView = MagicMock()
         self.graphics.graphicsView.horizontalScrollBar = MagicMock()
         self.graphics.graphicsView.horizontalScrollBar.return_value.value.return_value = 100
+        self.graphics.graphicsView.items.return_value = []
+        self.result = [[], []]
+        self._objects = {}
+
+    def fetch_object(self, name):
+        return self._objects.get(name)
+
+
+@pytest.fixture(autouse=True)
+def setup_compounds():
+    app = QApplication.instance() or QApplication(sys.argv)
+    compound_selected.clear()
+    compound_selected.extend(["Water(chemsep)", "Ethanol(chemsep)"])
+    yield app
+    compound_selected.clear()
+    while QApplication.overrideCursor() is not None:
+        QApplication.restoreOverrideCursor()
 
 
 @pytest.fixture
-def comp_widget():
-    obj = MockCompressorObj()
+def compressor_fixture():
+    obj = AdiabaticCompressor("Compressor1")
+    obj.param_setter = MagicMock()
     container = MockContainerInstance()
-    widget = DockWidgetCompressorExpander("Compressor1", "Compressor", obj, container)
+    container._objects[obj.name] = obj
+
+    mock_item = MagicMock()
+    mock_item.name = obj.name
+    mock_item.update_tooltip = MagicMock()
+    container.graphics.graphicsView.items.return_value = [mock_item]
+
+    widget = DockWidgetCompressorExpander(obj.name, "Compressor", obj, container)
+    return widget, obj, container, mock_item
+
+
+@pytest.fixture
+def expander_fixture():
+    obj = AdiabaticExpander("Expander1")
+    obj.param_setter = MagicMock()
+    container = MockContainerInstance()
+    container._objects[obj.name] = obj
+
+    widget = DockWidgetCompressorExpander(obj.name, "Expander", obj, container)
     return widget, obj, container
 
 
-def test_dock_widget_compressor_initialization(comp_widget):
-    widget, obj, _ = comp_widget
-    assert widget.name == "Compressor1"
+def test_compressor_initialization(compressor_fixture):
+    widget, obj, _, _ = compressor_fixture
+    assert widget.name == obj.name
     assert widget.type == "Compressor"
-    assert widget.obj == obj
-    assert widget.windowTitle() == "Compressor1"
-    assert widget.comboBox.count() >= 2
+    assert widget.obj is obj
+    assert widget.windowTitle() == obj.name
+    assert widget.comboBox.count() == 3
 
 
-def test_dock_widget_compressor_mode_selection(comp_widget):
-    widget, _, _ = comp_widget
-    widget.comboBox.setCurrentIndex(1)
-    assert len(widget.input_dict) > 0
+def test_expander_initialization(expander_fixture):
+    widget, obj, _ = expander_fixture
+    assert widget.name == obj.name
+    assert widget.type == "Expander"
+    assert widget.obj is obj
+    assert widget.windowTitle() == obj.name
+    assert widget.comboBox.count() == 3
 
 
-def test_dock_widget_compressor_param_submission(comp_widget):
-    widget, obj, _ = comp_widget
-    if "Pout" in widget.input_dict and hasattr(widget.input_dict["Pout"], "setText"):
-        widget.input_dict["Pout"].setText("300000")
-    if "eff" in widget.input_dict and hasattr(widget.input_dict["eff"], "setText"):
-        widget.input_dict["eff"].setText("80")
+def test_compressor_modes_selection_all_modes(compressor_fixture):
+    widget, obj, _, _ = compressor_fixture
+
+    # Test all 3 modes: Pdel, Pout, Q
+    for mode_idx in range(widget.comboBox.count()):
+        widget.comboBox.setCurrentIndex(mode_idx)
+        assert len(widget.input_dict) > 0
+        assert "Thermo Package" in widget.input_dict
+
+
+def test_compressor_empty_modes_fallback():
+    obj = AdiabaticCompressor("CompressorEmpty")
+    obj.modes_list = []
+    obj.param_getter = MagicMock(return_value={"Eff": 1})
+    container = MockContainerInstance()
+
+    widget = DockWidgetCompressorExpander(obj.name, "Compressor", obj, container)
+    assert not widget.comboBox.isEnabled()
+    assert "Eff" in widget.input_dict
+
+
+def test_compressor_param_submission_success(compressor_fixture):
+    widget, obj, container, mock_item = compressor_fixture
+
+    # Add an item that raises an exception on update_tooltip
+    failing_item = MagicMock()
+    failing_item.name = obj.name
+    failing_item.update_tooltip.side_effect = RuntimeError("tooltip failed")
+    container.graphics.graphicsView.items.return_value = [failing_item, mock_item]
+
+    # Mode 0 is Pdel
+    widget.comboBox.setCurrentIndex(0)
+    # Fill in values for line edits
+    for k, v in widget.input_dict.items():
+        if hasattr(v, "setText"):
+            v.setText("100000")
+
+    widget.show()
+    widget.param()
+
+    obj.param_setter.assert_called_once()
+    assert widget.dict["Pdel"] == "100000"
+    mock_item.update_tooltip.assert_called_once()
+    assert not widget.isVisible()
+
+
+def test_compressor_param_scrollbar_exception(compressor_fixture):
+    widget, obj, container, _ = compressor_fixture
+    container.graphics.graphicsView.horizontalScrollBar.side_effect = RuntimeError("scroll error")
+
+    widget.comboBox.setCurrentIndex(0)
+    for k, v in widget.input_dict.items():
+        if hasattr(v, "setText"):
+            v.setText("100000")
+
+    widget.show()
+    widget.param()
+    assert not widget.isVisible()
+
+
+def test_compressor_param_empty_field_shows_error(compressor_fixture):
+    widget, obj, _, _ = compressor_fixture
+    widget.show_error = MagicMock()
+
+    # Clear one of the line edits
+    for k, v in widget.input_dict.items():
+        if hasattr(v, "setText"):
+            v.setText("")
+            break
 
     widget.param()
-    obj.param_setter.assert_called_once()
-    assert widget.dict.get("Pout") == "300000"
-    assert widget.dict.get("eff") == "80"
+    widget.show_error.assert_called_once()
+
+
+def test_show_result_static(compressor_fixture):
+    widget, _, _, _ = compressor_fixture
+    mock_item = MagicMock()
+    mock_item.name = "CompA"
+    mock_item.results_category = MagicMock()
+
+    invalid_item = object()
+    DockWidgetCompressorExpander.show_result([mock_item, invalid_item])
+    mock_item.results_category.assert_called_once_with("CompA")
+
+
+def test_clear_results(compressor_fixture):
+    widget, _, _, _ = compressor_fixture
+    widget.tableWidget.setRowCount(5)
+    widget.clear_results()
+    assert widget.tableWidget.rowCount() == 0
+
+
+def test_results_category_success(compressor_fixture):
+    widget, obj, container, _ = compressor_fixture
+    name = obj.name
+
+    headers = [f"{name}.Pout", f"{name}.Eff", f"{name}.Q"]
+    values = [200000.0, 0.85, 4500.0]
+    container.result = [headers, values]
+
+    widget.results_category(name)
+    assert widget.tableWidget.rowCount() == 3
+    assert widget.tableWidget.item(0, 0).text() != ""
